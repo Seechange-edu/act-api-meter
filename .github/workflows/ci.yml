@@ -38,9 +38,14 @@ on:
         required: false
         type: string
 
+# One group for every deploy, and queued rather than cancelled. Pushing a
+# commit that touches both backend/ and frontend/ fires two workflows in the
+# source repo, so two Releases land here at once; letting them run together
+# would have two deploys restarting the same containers, and cancelling one
+# mid-restart would leave the host in whatever state it had reached.
 concurrency:
-  group: ${{ github.ref }}
-  cancel-in-progress: true
+  group: api-meter-deploy
+  cancel-in-progress: false
 
 jobs:
   build-and-deploy:
@@ -96,12 +101,28 @@ jobs:
       - name: Export deploy vars
         id: deploy-vars
         run: |
+          # DEPLOY_PARTS says what changed. Older Releases predate it, so an
+          # absent value means everything — the safe reading, since deploying
+          # too much is recoverable and deploying too little is a mystery.
+          PARTS="${{ env.DEPLOY_PARTS }}"
+          [ -z "$PARTS" ] && PARTS=all
           {
             echo "remote_host=${{ env.REMOTE_HOST }}"
             echo "teams_webhook=${{ env.TEAMS_WEBHOOK }}"
             echo "active=${{ env.ACTIVE }}"
             echo "image_tag=${{ env.BRANCH }}"
+            echo "parts=$PARTS"
           } >> "$GITHUB_OUTPUT"
+
+          {
+            echo "DEPLOY_PARTS=$PARTS"
+            case "$PARTS" in
+              all) echo "DO_BACKEND=1"; echo "DO_FRONTEND=1" ;;
+              backend) echo "DO_BACKEND=1"; echo "DO_FRONTEND=" ;;
+              frontend) echo "DO_BACKEND="; echo "DO_FRONTEND=1" ;;
+              *) echo "::error::unknown DEPLOY_PARTS '$PARTS'"; exit 1 ;;
+            esac
+          } >> "$GITHUB_ENV"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -161,17 +182,21 @@ jobs:
             echo "FRONTEND_URI=${FRONTEND_URI}"
           } >> $GITHUB_ENV
 
-          # One backend image for both processes: SERVICE is passed at `docker
-          # run`, not baked, so admin and proxy are the same bytes.
-          docker build --build-arg ENV=${{ env.ACTIVE }} \
-            --tag ${BACKEND_URI} --file backend/Dockerfile backend
-          docker push ${BACKEND_URI}
+          if [ -n "${{ env.DO_BACKEND }}" ]; then
+            # One backend image for both processes: SERVICE is passed at
+            # `docker run`, not baked, so admin and proxy are the same bytes.
+            docker build --build-arg ENV=${{ env.ACTIVE }} \
+              --tag ${BACKEND_URI} --file backend/Dockerfile backend
+            docker push ${BACKEND_URI}
+          fi
 
-          # Vite inlines its config at build time, so the profile has to be
-          # chosen here rather than at run time.
-          docker build --build-arg ENV=${{ env.ACTIVE }} \
-            --tag ${FRONTEND_URI} --file frontend/Dockerfile frontend
-          docker push ${FRONTEND_URI}
+          if [ -n "${{ env.DO_FRONTEND }}" ]; then
+            # Vite inlines its config at build time, so the profile has to be
+            # chosen here rather than at run time.
+            docker build --build-arg ENV=${{ env.ACTIVE }} \
+              --tag ${FRONTEND_URI} --file frontend/Dockerfile frontend
+            docker push ${FRONTEND_URI}
+          fi
 
       - name: Get ECR login token
         id: ecr-login-token
@@ -192,13 +217,13 @@ jobs:
           host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_TOKEN,BACKEND_URI,FRONTEND_URI
+          envs: ECR_REGISTRY,ECR_TOKEN,BACKEND_URI,FRONTEND_URI,DO_BACKEND,DO_FRONTEND
           script: |
             set -e
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
 
-            docker pull ${BACKEND_URI}
-            docker pull ${FRONTEND_URI}
+            [ -n "$DO_BACKEND" ] && docker pull ${BACKEND_URI}
+            [ -n "$DO_FRONTEND" ] && docker pull ${FRONTEND_URI}
 
             # The three share a user-defined network so the frontend's nginx can
             # reach admin by container name. Idempotent: already-exists is fine.
@@ -208,9 +233,15 @@ jobs:
             # broken deploy, and finding out from a 500 rather than from a
             # failed step here is strictly worse. `set -e` stops the deploy if
             # this fails, leaving the previous containers running.
-            docker run --rm --network ${{ env.NETWORK }} \
-              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
-              ${BACKEND_URI} alembic upgrade head
+            #
+            # Skipped for a frontend-only deploy: there is no new backend image
+            # to migrate for, and running the old one's migrations again would
+            # be a no-op with a chance of surprise.
+            if [ -n "$DO_BACKEND" ]; then
+              docker run --rm --network ${{ env.NETWORK }} \
+                -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+                ${BACKEND_URI} alembic upgrade head
+            fi
 
             restart() {
               name="$1"; shift
@@ -221,22 +252,33 @@ jobs:
                 --restart unless-stopped "$@"
             }
 
-            restart ${{ env.NAME }} \
-              -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
-              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
-              ${{ env.RUN_ARGS }} ${BACKEND_URI}
+            if [ -n "$DO_BACKEND" ]; then
+              restart ${{ env.NAME }} \
+                -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
+                -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+                ${{ env.RUN_ARGS }} ${BACKEND_URI}
 
-            restart ${{ env.PROXY_NAME }} \
-              -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
-              -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
-              ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
+              restart ${{ env.PROXY_NAME }} \
+                -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
+                -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
+                ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
+            fi
 
-            # nginx resolves the upstream once at start-up, so the frontend goes
-            # last — starting it before admin would leave it pointing at nothing.
-            restart ${{ env.WEB_NAME }} \
-              -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
-              -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
-              ${{ env.WEB_RUN_ARGS }} ${FRONTEND_URI}
+            # nginx resolves the upstream once at start-up, so it goes last, and
+            # is restarted whenever admin was — otherwise it keeps pointing at
+            # the address the old admin container had.
+            if [ -n "$DO_FRONTEND" ] || [ -n "$DO_BACKEND" ]; then
+              WEB_IMAGE="${FRONTEND_URI}"
+              if [ -z "$DO_FRONTEND" ]; then
+                # Backend-only deploy: reuse whatever the web container is
+                # already running rather than pulling a tag that was never built.
+                WEB_IMAGE=$(docker inspect --format '{{.Config.Image}}' ${{ env.WEB_NAME }} 2>/dev/null || echo "${FRONTEND_URI}")
+              fi
+              restart ${{ env.WEB_NAME }} \
+                -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
+                -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
+                ${{ env.WEB_RUN_ARGS }} ${WEB_IMAGE}
+            fi
 
             # A container that exits on startup would otherwise be a green
             # deploy, discovered later by someone loading the page.

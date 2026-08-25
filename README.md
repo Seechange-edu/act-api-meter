@@ -21,6 +21,22 @@ name.
 Migrations run before anything starts, and a failure stops the deploy with the
 previous containers still up.
 
+## Partial deploys
+
+The source repo's workflows are split by path and put `DEPLOY_PARTS` in the
+Release body — `backend`, `frontend`, or `all`. A frontend change therefore does
+not restart the proxy, which sits in front of paid API calls and drops whatever
+was in flight when it goes down.
+
+The web container restarts whenever admin does, whichever part triggered the
+deploy: nginx resolves its upstream once at start-up, so leaving it running
+would leave it pointing at the address the previous admin container had.
+
+Deploys share one concurrency group and queue rather than cancel. A commit
+touching both halves fires two workflows and lands two Releases here at once,
+and cancelling one mid-restart would leave the host in whatever state it had
+reached.
+
 ## Setup
 
 Settings → Secrets and variables → Actions:
