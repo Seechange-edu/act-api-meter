@@ -59,6 +59,7 @@ jobs:
       teams_webhook: ${{ steps.deploy-vars.outputs.teams_webhook }}
       active: ${{ steps.deploy-vars.outputs.active }}
       image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
+      parts: ${{ steps.deploy-vars.outputs.parts }}
       ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
       source_repo: ${{ steps.relinfo.outputs.source_repo }}
       commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
@@ -319,3 +320,111 @@ jobs:
           key: ${{ secrets.REMOTE_SSH_KEY }}
           script: |
             docker image prune --force
+
+  # Housekeeping only: never fails the run.
+  notify-teams:
+    needs: [build-and-deploy]
+    if: always() && needs.build-and-deploy.outputs.teams_webhook != ''
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Send Teams notification (Power Automate)
+        env:
+          WEBHOOK: ${{ needs.build-and-deploy.outputs.teams_webhook }}
+          STATUS: ${{ needs.build-and-deploy.result }}
+          SOURCE_REPO: ${{ needs.build-and-deploy.outputs.source_repo }}
+          ENVIRONMENT: ${{ needs.build-and-deploy.outputs.active }}
+          TAG: ${{ needs.build-and-deploy.outputs.image_tag }}
+          # backend / frontend / all. The card says which half went out rather
+          # than naming containers — three names would be noise to read, and
+          # what anyone wants to know is whether their change is live.
+          PARTS: ${{ needs.build-and-deploy.outputs.parts }}
+          COMMIT_SHORT: ${{ needs.build-and-deploy.outputs.commit_short }}
+          COMMIT_MESSAGE: ${{ needs.build-and-deploy.outputs.commit_message }}
+          COMMIT_URL: ${{ needs.build-and-deploy.outputs.commit_url }}
+          RELEASE_NOTES: ${{ needs.build-and-deploy.outputs.release_notes }}
+          ACTOR: ${{ github.actor }}
+          EVENT: ${{ github.event_name }}
+          RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          # jq builds the whole card so a commit message or release note with
+          # quotes in it cannot break the payload.
+          case "$PARTS" in
+            all) DEPLOYED="Backend and frontend" ;;
+            backend) DEPLOYED="Backend only" ;;
+            frontend) DEPLOYED="Frontend only" ;;
+            *) DEPLOYED="$PARTS" ;;
+          esac
+
+          jq -n \
+            --arg status "$STATUS" \
+            --arg source_repo "$SOURCE_REPO" \
+            --arg environment "$ENVIRONMENT" \
+            --arg tag "$TAG" \
+            --arg deployed "$DEPLOYED" \
+            --arg commit_short "$COMMIT_SHORT" \
+            --arg commit_message "$COMMIT_MESSAGE" \
+            --arg commit_url "$COMMIT_URL" \
+            --arg release_notes "$RELEASE_NOTES" \
+            --arg actor "$ACTOR" \
+            --arg event "$EVENT" \
+            --arg run_url "$RUN_URL" \
+            '{
+              type: "message",
+              attachments: [{
+                contentType: "application/vnd.microsoft.card.adaptive",
+                contentUrl: null,
+                content: {
+                  "$schema": "http://adaptivecards.io/schemas/adaptive-card.json",
+                  type: "AdaptiveCard",
+                  version: "1.4",
+                  msteams: { width: "Full" },
+                  body: [
+                    {
+                      type: "Container",
+                      style: (if $status == "success" then "good" else "attention" end),
+                      bleed: true,
+                      items: [
+                        {
+                          type: "TextBlock",
+                          text: (if $status == "success" then "✅ api-meter deployed" else "❌ api-meter deploy failed" end),
+                          weight: "Bolder",
+                          size: "Medium",
+                          wrap: true
+                        },
+                        {
+                          type: "TextBlock",
+                          text: ($deployed + " → " + $environment),
+                          spacing: "None",
+                          isSubtle: true,
+                          wrap: true
+                        }
+                      ]
+                    },
+                    {
+                      type: "FactSet",
+                      facts: [
+                        { title: "Environment", value: $environment },
+                        { title: "Deployed", value: $deployed },
+                        { title: "Tag / Branch", value: $tag },
+                        { title: "Commit", value: ("[" + $commit_short + "](" + $commit_url + ")") },
+                        { title: "Commit message", value: $commit_message },
+                        { title: "Triggered by", value: ($actor + " (" + $event + ")") },
+                        { title: "Result", value: $status }
+                      ]
+                    },
+                    { type: "TextBlock", text: "**Release notes**", wrap: true, spacing: "Medium" },
+                    {
+                      type: "Container",
+                      style: "emphasis",
+                      items: [ { type: "TextBlock", text: $release_notes, wrap: true } ]
+                    }
+                  ],
+                  actions: [
+                    { type: "Action.OpenUrl", title: "View workflow run", url: $run_url },
+                    { type: "Action.OpenUrl", title: "View commit", url: $commit_url }
+                  ]
+                }
+              }]
+            }' \
+          | curl -sS --fail-with-body -X POST -H 'Content-Type: application/json' --data @- "$WEBHOOK"
