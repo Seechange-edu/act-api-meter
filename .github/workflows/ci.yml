@@ -1,0 +1,279 @@
+# api-meter deploy (Action Factory).
+#
+# Triggered by a Release created by the stringify step in the source repo
+# api-meter; the Release body carries branch/repository/envValue etc.
+#
+# Unlike the single-image projects, api-meter is a monorepo that deploys three
+# containers from two images:
+#
+#   backend image  ->  admin   (management API, serves the operator UI's data)
+#                  ->  proxy   (what applications call: /gw forwarding + /v1 ingest)
+#   frontend image ->  web     (nginx: the UI, and /api forwarded to admin)
+#
+# admin and proxy are the same image with a different SERVICE, deployed apart so
+# a heavy report query cannot add latency to a path sitting in front of a paid
+# API call.
+#
+# Configure in this repo's Settings -> Secrets and variables -> Actions:
+#   Secrets:   ACTION_TOKEN (can checkout the source repo api-meter), REMOTE_SSH_KEY
+#   Variables: AWS_ROLE_ARN, AWS_REGION, REMOTE_USER, AWS_ECR_REPOSITORY (api-meter)
+#
+# Two ECR repositories must exist per environment — ECR does not create them on
+# push: <AWS_ECR_REPOSITORY>/<active>/backend and <AWS_ECR_REPOSITORY>/<active>/frontend.
+#
+# Env is baked into the image: the source repo tracks backend/env/<ENV>.env and
+# frontend/env/<ENV>.env, the build passes --build-arg ENV=${ACTIVE}, and secrets
+# come from AWS SSM at startup. No env file on the deploy host.
+name: api-meter - Build & Push Docker
+
+on:
+  release:
+    types: [published]
+  # Manual redeploy: by default re-parses the body of this repo's latest
+  # Release; a specific Release tag can also be given.
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'act-api-meter Release tag to redeploy (empty = latest)'
+        required: false
+        type: string
+
+concurrency:
+  group: ${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/api-meter/')
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      remote_host: ${{ steps.deploy-vars.outputs.remote_host }}
+      teams_webhook: ${{ steps.deploy-vars.outputs.teams_webhook }}
+      active: ${{ steps.deploy-vars.outputs.active }}
+      image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
+      ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+      source_repo: ${{ steps.relinfo.outputs.source_repo }}
+      commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
+      commit_short: ${{ steps.relinfo.outputs.commit_short }}
+      commit_message: ${{ steps.relinfo.outputs.commit_message }}
+      commit_url: ${{ steps.relinfo.outputs.commit_url }}
+      release_notes: ${{ steps.relinfo.outputs.release_notes }}
+    steps:
+      - name: get tag info
+        if: github.event_name == 'release'
+        uses: Seechange-edu/Parse-Action-Tag@main
+        with:
+          githubToken: ${{ secrets.ACTION_TOKEN }}
+          type: parse
+
+      # Manual dispatch has no release payload, so fetch the body and export the
+      # same variables ourselves.
+      - name: resolve deploy vars (manual dispatch)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          RELEASE_TAG: ${{ inputs.release_tag }}
+        run: |
+          if [ -n "$RELEASE_TAG" ]; then
+            BODY=$(gh release view "$RELEASE_TAG" --repo "${{ github.repository }}" --json body -q .body)
+          else
+            BODY=$(gh release view --repo "${{ github.repository }}" --json body -q .body)
+          fi
+          echo "$BODY" | jq -r '
+            "BRANCH=\(.branch)",
+            "REPOSITORY=\(.repository)",
+            "PUSHREF=\(.pushRef)",
+            "REMOTE_HOST=\(.remoteHost)",
+            "TEAMS_WEBHOOK=\(.teamsWebhook // "")",
+            (.envValue | to_entries[] | "\(.key)=\(.value)")
+          ' >> "$GITHUB_ENV"
+
+      # Before the build, so notify-teams still has the webhook and tag when a
+      # later step fails.
+      - name: Export deploy vars
+        id: deploy-vars
+        run: |
+          {
+            echo "remote_host=${{ env.REMOTE_HOST }}"
+            echo "teams_webhook=${{ env.TEAMS_WEBHOOK }}"
+            echo "active=${{ env.ACTIVE }}"
+            echo "image_tag=${{ env.BRANCH }}"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: SeeChange-edu/${{ env.REPOSITORY }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          ref: ${{ env.BRANCH }}
+
+      - name: Collect commit and release info
+        id: relinfo
+        env:
+          GH_TOKEN: ${{ secrets.ACTION_TOKEN }}
+          SRC_REPO: SeeChange-edu/${{ env.REPOSITORY }}
+          REF: ${{ env.BRANCH }}
+        run: |
+          SHA=$(git rev-parse HEAD)
+          SHORT=$(git rev-parse --short HEAD)
+          SUBJECT=$(git log -1 --pretty=%s)
+          NOTES=$(gh release view "$REF" --repo "$SRC_REPO" --json body -q .body 2>/dev/null | head -c 1500 || true)
+          if [ -z "$NOTES" ]; then NOTES="_(no release notes — branch deploy)_"; fi
+          D=$(openssl rand -hex 8)
+          {
+            echo "source_repo=$SRC_REPO"
+            echo "commit_sha=$SHA"
+            echo "commit_short=$SHORT"
+            echo "commit_url=${{ github.server_url }}/$SRC_REPO/commit/$SHA"
+            echo "commit_message<<$D"
+            echo "$SUBJECT"
+            echo "$D"
+            echo "release_notes<<$D"
+            echo "$NOTES"
+            echo "$D"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Setup AWS ECR Details (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-ECR-Push
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login-pf-aws-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push Docker images
+        env:
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ env.BRANCH }}
+        run: |
+          BASE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}"
+          BACKEND_URI="${BASE}/backend:${IMAGE_TAG}"
+          FRONTEND_URI="${BASE}/frontend:${IMAGE_TAG}"
+          {
+            echo "BACKEND_URI=${BACKEND_URI}"
+            echo "FRONTEND_URI=${FRONTEND_URI}"
+          } >> $GITHUB_ENV
+
+          # One backend image for both processes: SERVICE is passed at `docker
+          # run`, not baked, so admin and proxy are the same bytes.
+          docker build --build-arg ENV=${{ env.ACTIVE }} \
+            --tag ${BACKEND_URI} --file backend/Dockerfile backend
+          docker push ${BACKEND_URI}
+
+          # Vite inlines its config at build time, so the profile has to be
+          # chosen here rather than at run time.
+          docker build --build-arg ENV=${{ env.ACTIVE }} \
+            --tag ${FRONTEND_URI} --file frontend/Dockerfile frontend
+          docker push ${FRONTEND_URI}
+
+      - name: Get ECR login token
+        id: ecr-login-token
+        run: |
+          ECR_TOKEN=$(aws ecr get-login-password --region ${{ vars.AWS_REGION }})
+          echo "token<<EOF" >> $GITHUB_OUTPUT
+          echo "$ECR_TOKEN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: SSH and run the containers
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
+          BACKEND_URI: ${{ env.BACKEND_URI }}
+          FRONTEND_URI: ${{ env.FRONTEND_URI }}
+        with:
+          host: ${{ env.REMOTE_HOST }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_TOKEN,BACKEND_URI,FRONTEND_URI
+          script: |
+            set -e
+            echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+
+            docker pull ${BACKEND_URI}
+            docker pull ${FRONTEND_URI}
+
+            # The three share a user-defined network so the frontend's nginx can
+            # reach admin by container name. Idempotent: already-exists is fine.
+            docker network create ${{ env.NETWORK }} 2>/dev/null || true
+
+            # Migrations before anything starts. A schema behind the code is a
+            # broken deploy, and finding out from a 500 rather than from a
+            # failed step here is strictly worse. `set -e` stops the deploy if
+            # this fails, leaving the previous containers running.
+            docker run --rm --network ${{ env.NETWORK }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+              ${BACKEND_URI} alembic upgrade head
+
+            restart() {
+              name="$1"; shift
+              if [ "$(docker ps -a --format '{{.Names}}' | grep -cx "$name")" -gt 0 ]; then
+                docker rm -f "$name"
+              fi
+              docker run --name "$name" -d --network ${{ env.NETWORK }} \
+                --restart unless-stopped "$@"
+            }
+
+            restart ${{ env.NAME }} \
+              -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+              ${{ env.RUN_ARGS }} ${BACKEND_URI}
+
+            restart ${{ env.PROXY_NAME }} \
+              -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
+              ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
+
+            # nginx resolves the upstream once at start-up, so the frontend goes
+            # last — starting it before admin would leave it pointing at nothing.
+            restart ${{ env.WEB_NAME }} \
+              -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
+              -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
+              ${{ env.WEB_RUN_ARGS }} ${FRONTEND_URI}
+
+            # A container that exits on startup would otherwise be a green
+            # deploy, discovered later by someone loading the page.
+            for target in \
+              "admin  http://localhost:${{ env.OUT_PORT }}/healthz" \
+              "proxy  http://localhost:${{ env.PROXY_OUT_PORT }}/healthz" \
+              "web    http://localhost:${{ env.WEB_OUT_PORT }}/api/healthz"; do
+              label=${target%% *}; url=${target##* }
+              for attempt in 1 2 3 4 5 6 7 8 9 10; do
+                if curl -fsS --max-time 3 "$url" >/dev/null; then
+                  echo "$label ok"
+                  break
+                fi
+                if [ "$attempt" = 10 ]; then
+                  echo "::error::$label did not come up at $url"
+                  docker logs --tail 50 "$( [ "$label" = web ] && echo ${{ env.WEB_NAME }} || \
+                    { [ "$label" = proxy ] && echo ${{ env.PROXY_NAME }} || echo ${{ env.NAME }}; } )" || true
+                  exit 1
+                fi
+                sleep 3
+              done
+            done
+
+            docker image prune --force
+
+  # Housekeeping only: never fails the run.
+  prune-images:
+    needs: [build-and-deploy]
+    if: needs.build-and-deploy.result == 'success'
+    continue-on-error: true
+    runs-on: ubuntu-latest
+    steps:
+      - name: Prune dangling images on the host
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: ${{ needs.build-and-deploy.outputs.remote_host }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          script: |
+            docker image prune --force
