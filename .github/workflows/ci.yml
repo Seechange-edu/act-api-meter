@@ -428,7 +428,9 @@ jobs:
               done
             done
 
-            docker image prune --force
+            # Image pruning moved to the prune-images job, which never fails the
+            # run: a prune already running on the host would fail this script and
+            # mark a deploy that actually succeeded as red.
 
   # Housekeeping only: never fails the run.
   prune-images:
