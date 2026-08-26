@@ -439,14 +439,87 @@ jobs:
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
+      # Its own step, and its own continue-on-error: a prune already running on
+      # the host fails this one, and a failed step would otherwise skip the
+      # semver sweep below along with it.
       - name: Prune dangling images on the host
+        continue-on-error: true
         uses: appleboy/ssh-action@v1.2.0
         with:
           host: ${{ needs.setup.outputs.remote_host }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
+          # A branch tag such as :dev takes its name off the previous image on
+          # every pull, leaving layers the semver sweep below never looks at.
+          script: docker image prune --force
+
+      # Only bites once api-meter deploys by release tag: the image tag is
+      # whatever `branch` the Release body carried, so today it is `dev` or
+      # `prod` and this exits early. When that becomes a vX.Y.Z, the versioned
+      # images would otherwise pile up untouched.
+      - name: Prune old semver images
+        continue-on-error: true
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+          IMAGE_TAG: ${{ needs.setup.outputs.image_tag }}
+          ACTIVE: ${{ needs.setup.outputs.active }}
+        with:
+          host: ${{ needs.setup.outputs.remote_host }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REPOSITORY,IMAGE_TAG,ACTIVE
           script: |
-            docker image prune --force
+            CURRENT="${IMAGE_TAG}"
+
+            if ! echo "$CURRENT" | grep -qE '^[vV][0-9]+\.[0-9]+\.[0-9]+$'; then
+              echo "Skip prune: IMAGE_TAG '${CURRENT}' is not semver"
+              exit 0
+            fi
+
+            # Two image repositories, not one: the backend image runs as admin
+            # and proxy, the frontend image as web. The registry host is not
+            # known on this side, so match on the repository path and take the
+            # full name back from `docker images`.
+            for part in backend frontend; do
+              mapfile -t REPOS < <(
+                docker images --format '{{.Repository}}' \
+                  | grep -- "/${ECR_REPOSITORY}/${ACTIVE}/${part}\$" \
+                  | sort -u
+              )
+              if [ ${#REPOS[@]} -eq 0 ]; then
+                echo "No ${part} images on this host"
+                continue
+              fi
+
+              for IMAGE_PREFIX in "${REPOS[@]}"; do
+                mapfile -t TAGS < <(
+                  docker images --format '{{.Repository}}:{{.Tag}}' \
+                    | grep "^${IMAGE_PREFIX}:" \
+                    | sed "s|^${IMAGE_PREFIX}:||" \
+                    | grep -E '^[vV][0-9]+\.[0-9]+\.[0-9]+$' \
+                    | sort -V
+                )
+                [ ${#TAGS[@]} -eq 0 ] && continue
+
+                PREV=$(printf '%s\n' "${TAGS[@]}" | sort -V | awk -v cur="$CURRENT" '
+                  { a[++n]=$0 }
+                  END { for(i=1;i<=n;i++) if(a[i]==cur && i>1) { print a[i-1]; exit } }')
+
+                if [ -n "$PREV" ]; then
+                  echo "Keep ${IMAGE_PREFIX}: ${CURRENT}, ${PREV}"
+                else
+                  echo "Keep ${IMAGE_PREFIX}: ${CURRENT} only (no previous version)"
+                fi
+
+                for tag in "${TAGS[@]}"; do
+                  [ "$tag" = "$CURRENT" ] && continue
+                  [ -n "$PREV" ] && [ "$tag" = "$PREV" ] && continue
+                  echo "Removing ${IMAGE_PREFIX}:${tag}"
+                  docker rmi "${IMAGE_PREFIX}:${tag}" 2>/dev/null || true
+                done
+              done
+            done
 
   # Housekeeping only: never fails the run.
   notify-teams:
