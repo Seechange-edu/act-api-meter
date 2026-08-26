@@ -38,29 +38,33 @@ on:
         required: false
         type: string
 
-# One group for every deploy, and queued rather than cancelled. Pushing a
-# commit that touches both backend/ and frontend/ fires two workflows in the
-# source repo, so two Releases land here at once; letting them run together
-# would have two deploys restarting the same containers, and cancelling one
-# mid-restart would leave the host in whatever state it had reached.
+# One group for every deploy, and queued rather than cancelled. Two runs at
+# once would have two deploys restarting the same containers, and cancelling one
+# mid-restart would leave the host in whatever state it had reached — so a
+# second release waits for the first to finish rather than racing it.
 concurrency:
   group: api-meter-deploy
   cancel-in-progress: false
 
 jobs:
-  build-and-deploy:
+  # Reads the Release, works out what to deploy, and hands both on. Split from
+  # the build so the two halves fail separately: a red X against build-frontend
+  # says which one broke without anyone opening a log.
+  setup:
     if: github.event_name == 'workflow_dispatch' || startsWith(github.ref, 'refs/tags/api-meter/')
     runs-on: ubuntu-latest
-    permissions:
-      id-token: write
-      contents: read
     outputs:
       remote_host: ${{ steps.deploy-vars.outputs.remote_host }}
       teams_webhook: ${{ steps.deploy-vars.outputs.teams_webhook }}
       active: ${{ steps.deploy-vars.outputs.active }}
       image_tag: ${{ steps.deploy-vars.outputs.image_tag }}
       parts: ${{ steps.deploy-vars.outputs.parts }}
-      ecr_registry: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+      do_backend: ${{ steps.deploy-vars.outputs.do_backend }}
+      do_frontend: ${{ steps.deploy-vars.outputs.do_frontend }}
+      # Everything the Release body carried, as JSON. Each job below runs on its
+      # own runner with an empty environment, so container names, ports and the
+      # network have to travel rather than being re-parsed three times.
+      vars: ${{ steps.deploy-vars.outputs.vars }}
       source_repo: ${{ steps.relinfo.outputs.source_repo }}
       commit_sha: ${{ steps.relinfo.outputs.commit_sha }}
       commit_short: ${{ steps.relinfo.outputs.commit_short }}
@@ -115,15 +119,37 @@ jobs:
             echo "parts=$PARTS"
           } >> "$GITHUB_OUTPUT"
 
-          {
-            echo "DEPLOY_PARTS=$PARTS"
-            case "$PARTS" in
-              all) echo "DO_BACKEND=1"; echo "DO_FRONTEND=1" ;;
-              backend) echo "DO_BACKEND=1"; echo "DO_FRONTEND=" ;;
-              frontend) echo "DO_BACKEND="; echo "DO_FRONTEND=1" ;;
-              *) echo "::error::unknown DEPLOY_PARTS '$PARTS'"; exit 1 ;;
-            esac
-          } >> "$GITHUB_ENV"
+          # Empty means "skip that build job", which is what its `if` reads.
+          case "$PARTS" in
+            all)      echo "do_backend=1"; echo "do_frontend=1" ;;
+            backend)  echo "do_backend=1"; echo "do_frontend="  ;;
+            frontend) echo "do_backend=";  echo "do_frontend=1" ;;
+            *) echo "::error::unknown DEPLOY_PARTS '$PARTS'"; exit 1 ;;
+          esac >> "$GITHUB_OUTPUT"
+
+          # Named one by one rather than scraped out of $GITHUB_ENV, so a key
+          # the Release body forgot fails here instead of three jobs later as a
+          # container started with an empty port.
+          jq -nc \
+            --arg NETWORK "${{ env.NETWORK }}" \
+            --arg NAME "${{ env.NAME }}" \
+            --arg PORT "${{ env.PORT }}" \
+            --arg OUT_PORT "${{ env.OUT_PORT }}" \
+            --arg RUN_ARGS "${{ env.RUN_ARGS }}" \
+            --arg PROXY_NAME "${{ env.PROXY_NAME }}" \
+            --arg PROXY_PORT "${{ env.PROXY_PORT }}" \
+            --arg PROXY_OUT_PORT "${{ env.PROXY_OUT_PORT }}" \
+            --arg PROXY_RUN_ARGS "${{ env.PROXY_RUN_ARGS }}" \
+            --arg WEB_NAME "${{ env.WEB_NAME }}" \
+            --arg WEB_PORT "${{ env.WEB_PORT }}" \
+            --arg WEB_OUT_PORT "${{ env.WEB_OUT_PORT }}" \
+            --arg WEB_RUN_ARGS "${{ env.WEB_RUN_ARGS }}" \
+            --arg ACTIVE "${{ env.ACTIVE }}" \
+            --arg BRANCH "${{ env.BRANCH }}" \
+            --arg REPOSITORY "${{ env.REPOSITORY }}" \
+            --arg REMOTE_HOST "${{ env.REMOTE_HOST }}" \
+            '$ARGS.named' > vars.json
+          echo "vars=$(cat vars.json)" >> "$GITHUB_OUTPUT"
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -158,6 +184,32 @@ jobs:
             echo "$D"
           } >> "$GITHUB_OUTPUT"
 
+
+  build-backend:
+    needs: [setup]
+    if: needs.setup.outputs.do_backend != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      # What the Release body said, put back into the environment. Passed through
+      # `env:` rather than interpolated into the script, so nothing in the body
+      # can be read as shell.
+      - name: Restore deploy vars
+        env:
+          VARS: ${{ needs.setup.outputs.vars }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$VARS" >> "$GITHUB_ENV"
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: SeeChange-edu/${{ env.REPOSITORY }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          ref: ${{ env.BRANCH }}
+
       - name: Setup AWS ECR Details (OIDC)
         uses: aws-actions/configure-aws-credentials@v4
         with:
@@ -166,38 +218,107 @@ jobs:
           aws-region: ${{ vars.AWS_REGION }}
 
       - name: Login to AWS ECR
-        id: login-pf-aws-ecr
+        id: login
         uses: aws-actions/amazon-ecr-login@v1
 
-      - name: Build and push Docker images
+      - name: Build and push the backend image
+        id: build
         env:
-          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_REGISTRY: ${{ steps.login.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
-          IMAGE_TAG: ${{ env.BRANCH }}
         run: |
-          BASE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}"
-          BACKEND_URI="${BASE}/backend:${IMAGE_TAG}"
-          FRONTEND_URI="${BASE}/frontend:${IMAGE_TAG}"
-          {
-            echo "BACKEND_URI=${BACKEND_URI}"
-            echo "FRONTEND_URI=${FRONTEND_URI}"
-          } >> $GITHUB_ENV
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}/backend:${{ env.BRANCH }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          # One backend image for both processes: SERVICE is passed at
+          # `docker run`, not baked, so admin and proxy are the same bytes.
+          docker build --build-arg ENV=${{ env.ACTIVE }} \
+            --tag ${IMAGE} --file backend/Dockerfile backend
+          docker push ${IMAGE}
 
-          if [ -n "${{ env.DO_BACKEND }}" ]; then
-            # One backend image for both processes: SERVICE is passed at
-            # `docker run`, not baked, so admin and proxy are the same bytes.
-            docker build --build-arg ENV=${{ env.ACTIVE }} \
-              --tag ${BACKEND_URI} --file backend/Dockerfile backend
-            docker push ${BACKEND_URI}
-          fi
+  build-frontend:
+    needs: [setup]
+    if: needs.setup.outputs.do_frontend != ''
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image: ${{ steps.build.outputs.image }}
+    steps:
+      # What the Release body said, put back into the environment. Passed through
+      # `env:` rather than interpolated into the script, so nothing in the body
+      # can be read as shell.
+      - name: Restore deploy vars
+        env:
+          VARS: ${{ needs.setup.outputs.vars }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$VARS" >> "$GITHUB_ENV"
 
-          if [ -n "${{ env.DO_FRONTEND }}" ]; then
-            # Vite inlines its config at build time, so the profile has to be
-            # chosen here rather than at run time.
-            docker build --build-arg ENV=${{ env.ACTIVE }} \
-              --tag ${FRONTEND_URI} --file frontend/Dockerfile frontend
-            docker push ${FRONTEND_URI}
-          fi
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          repository: SeeChange-edu/${{ env.REPOSITORY }}
+          token: ${{ secrets.ACTION_TOKEN }}
+          ref: ${{ env.BRANCH }}
+
+      - name: Setup AWS ECR Details (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-ECR-Push
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Build and push the frontend image
+        id: build
+        env:
+          ECR_REGISTRY: ${{ steps.login.outputs.registry }}
+          ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
+        run: |
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}/frontend:${{ env.BRANCH }}"
+          echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
+          # Vite inlines its config at build time, so the profile has to be
+          # chosen here rather than at run time.
+          docker build --build-arg ENV=${{ env.ACTIVE }} \
+            --tag ${IMAGE} --file frontend/Dockerfile frontend
+          docker push ${IMAGE}
+
+  # One job, deliberately serial. Migrations run before anything starts, and the
+  # frontend's nginx resolves the admin address once at start-up, so it has to
+  # restart after admin — two jobs racing over the same host would break that
+  # order and fight over the same container names.
+  deploy:
+    needs: [setup, build-backend, build-frontend]
+    if: >-
+      !cancelled()
+      && needs.setup.result == 'success'
+      && needs.build-backend.result != 'failure'
+      && needs.build-frontend.result != 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      # What the Release body said, put back into the environment. Passed through
+      # `env:` rather than interpolated into the script, so nothing in the body
+      # can be read as shell.
+      - name: Restore deploy vars
+        env:
+          VARS: ${{ needs.setup.outputs.vars }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$VARS" >> "$GITHUB_ENV"
+
+      - name: Setup AWS ECR Details (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-ECR-Pull
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login-pf-aws-ecr
+        uses: aws-actions/amazon-ecr-login@v1
 
       - name: Get ECR login token
         id: ecr-login-token
@@ -212,8 +333,12 @@ jobs:
         env:
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
           ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
-          BACKEND_URI: ${{ env.BACKEND_URI }}
-          FRONTEND_URI: ${{ env.FRONTEND_URI }}
+          # Empty when that half was skipped, which is exactly what the guards
+          # below read: no image was built, so nothing of it is pulled.
+          BACKEND_URI: ${{ needs.build-backend.outputs.image }}
+          FRONTEND_URI: ${{ needs.build-frontend.outputs.image }}
+          DO_BACKEND: ${{ needs.setup.outputs.do_backend }}
+          DO_FRONTEND: ${{ needs.setup.outputs.do_frontend }}
         with:
           host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
@@ -307,15 +432,15 @@ jobs:
 
   # Housekeeping only: never fails the run.
   prune-images:
-    needs: [build-and-deploy]
-    if: needs.build-and-deploy.result == 'success'
+    needs: [setup, deploy]
+    if: needs.deploy.result == 'success'
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - name: Prune dangling images on the host
         uses: appleboy/ssh-action@v1.2.0
         with:
-          host: ${{ needs.build-and-deploy.outputs.remote_host }}
+          host: ${{ needs.setup.outputs.remote_host }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
           script: |
@@ -323,26 +448,29 @@ jobs:
 
   # Housekeeping only: never fails the run.
   notify-teams:
-    needs: [build-and-deploy]
-    if: always() && needs.build-and-deploy.outputs.teams_webhook != ''
+    needs: [setup, build-backend, build-frontend, deploy]
+    if: always() && needs.setup.outputs.teams_webhook != ''
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - name: Send Teams notification (Power Automate)
         env:
-          WEBHOOK: ${{ needs.build-and-deploy.outputs.teams_webhook }}
-          STATUS: ${{ needs.build-and-deploy.result }}
-          SOURCE_REPO: ${{ needs.build-and-deploy.outputs.source_repo }}
-          ENVIRONMENT: ${{ needs.build-and-deploy.outputs.active }}
-          TAG: ${{ needs.build-and-deploy.outputs.image_tag }}
+          WEBHOOK: ${{ needs.setup.outputs.teams_webhook }}
+          # A build that failed never reached the deploy, and the deploy job is
+          # then skipped rather than failed — reading only its result would
+          # send a green card for a release that never went out.
+          STATUS: ${{ (needs.build-backend.result != 'failure' && needs.build-frontend.result != 'failure' && needs.deploy.result == 'success') && 'success' || 'failure' }}
+          SOURCE_REPO: ${{ needs.setup.outputs.source_repo }}
+          ENVIRONMENT: ${{ needs.setup.outputs.active }}
+          TAG: ${{ needs.setup.outputs.image_tag }}
           # backend / frontend / all. The card says which half went out rather
           # than naming containers — three names would be noise to read, and
           # what anyone wants to know is whether their change is live.
-          PARTS: ${{ needs.build-and-deploy.outputs.parts }}
-          COMMIT_SHORT: ${{ needs.build-and-deploy.outputs.commit_short }}
-          COMMIT_MESSAGE: ${{ needs.build-and-deploy.outputs.commit_message }}
-          COMMIT_URL: ${{ needs.build-and-deploy.outputs.commit_url }}
-          RELEASE_NOTES: ${{ needs.build-and-deploy.outputs.release_notes }}
+          PARTS: ${{ needs.setup.outputs.parts }}
+          COMMIT_SHORT: ${{ needs.setup.outputs.commit_short }}
+          COMMIT_MESSAGE: ${{ needs.setup.outputs.commit_message }}
+          COMMIT_URL: ${{ needs.setup.outputs.commit_url }}
+          RELEASE_NOTES: ${{ needs.setup.outputs.release_notes }}
           ACTOR: ${{ github.actor }}
           EVENT: ${{ github.event_name }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
