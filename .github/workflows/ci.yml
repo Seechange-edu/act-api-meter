@@ -40,10 +40,12 @@ on:
         required: false
         type: string
 
-# One group for every deploy, and queued rather than cancelled. Two runs at
-# once would have two deploys restarting the same containers, and cancelling one
+# One group for every deploy, and queued rather than cancelled. Two runs at once
+# would have two deploys restarting the same containers, and cancelling one
 # mid-restart would leave the host in whatever state it had reached — so a
-# second release waits for the first to finish rather than racing it.
+# second release waits for the first to finish rather than racing it. This is
+# also what keeps the two deploy jobs below from being raced by another run:
+# within a run they are ordered, across runs they are queued.
 concurrency:
   group: api-meter-deploy
   cancel-in-progress: false
@@ -319,25 +321,22 @@ jobs:
             --tag ${IMAGE} --file frontend/Dockerfile frontend
           docker push ${IMAGE}
 
-  # One job, deliberately serial. Migrations run before anything starts, and the
-  # frontend's nginx resolves the admin address once at start-up, so it has to
-  # restart after admin — two jobs racing over the same host would break that
-  # order and fight over the same container names.
-  deploy:
-    needs: [setup, build-backend, build-frontend]
+  # Backend first, so the frontend restarts against the admin container it will
+  # actually talk to. Split from the frontend deploy so a failure here — a
+  # migration that will not apply, an image that will not start — cannot also
+  # keep a finished frontend off the server.
+  deploy-backend:
+    needs: [setup, build-backend]
     if: >-
       !cancelled()
       && needs.setup.result == 'success'
-      && needs.build-backend.result != 'failure'
-      && needs.build-frontend.result != 'failure'
+      && needs.setup.outputs.do_backend != ''
+      && needs.build-backend.result == 'success'
     runs-on: ubuntu-latest
     permissions:
       id-token: write
       contents: read
     steps:
-      # What the Release body said, put back into the environment. Passed through
-      # `env:` rather than interpolated into the script, so nothing in the body
-      # can be read as shell.
       - name: Restore deploy vars
         env:
           VARS: ${{ needs.setup.outputs.vars }}
@@ -362,28 +361,24 @@ jobs:
           echo "$ECR_TOKEN" >> $GITHUB_OUTPUT
           echo "EOF" >> $GITHUB_OUTPUT
 
-      - name: SSH and run the containers
+      - name: SSH and run admin and proxy
         uses: appleboy/ssh-action@v1.2.0
         env:
           ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
           ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
-          # Empty when that half was skipped, which is exactly what the guards
-          # below read: no image was built, so nothing of it is pulled.
           BACKEND_URI: ${{ needs.build-backend.outputs.image }}
-          FRONTEND_URI: ${{ needs.build-frontend.outputs.image }}
-          DO_BACKEND: ${{ needs.setup.outputs.do_backend }}
+          # Empty when the frontend is not part of this deploy, which is what
+          # decides whether web has to be restarted here.
           DO_FRONTEND: ${{ needs.setup.outputs.do_frontend }}
         with:
           host: ${{ env.REMOTE_HOST }}
           username: ${{ vars.REMOTE_USER }}
           key: ${{ secrets.REMOTE_SSH_KEY }}
-          envs: ECR_REGISTRY,ECR_TOKEN,BACKEND_URI,FRONTEND_URI,DO_BACKEND,DO_FRONTEND
+          envs: ECR_REGISTRY,ECR_TOKEN,BACKEND_URI,DO_FRONTEND
           script: |
             set -e
             echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
-
-            [ -n "$DO_BACKEND" ] && docker pull ${BACKEND_URI}
-            [ -n "$DO_FRONTEND" ] && docker pull ${FRONTEND_URI}
+            docker pull ${BACKEND_URI}
 
             # The three share a user-defined network so the frontend's nginx can
             # reach admin by container name. Idempotent: already-exists is fine.
@@ -391,25 +386,15 @@ jobs:
 
             # Migrations before anything starts. A schema behind the code is a
             # broken deploy, and finding out from a 500 rather than from a
-            # failed step here is strictly worse. `set -e` stops the deploy if
-            # this fails, leaving the previous containers running.
-            #
-            # Skipped for a frontend-only deploy: there is no new backend image
-            # to migrate for, and running the old one's migrations again would
-            # be a no-op with a chance of surprise.
-            if [ -n "$DO_BACKEND" ]; then
-              docker run --rm --network ${{ env.NETWORK }} \
-                -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
-                ${BACKEND_URI} alembic upgrade head
-            fi
+            # failed step here is strictly worse. `set -e` stops this job if it
+            # fails, leaving the previous containers running.
+            docker run --rm --network ${{ env.NETWORK }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+              ${BACKEND_URI} alembic upgrade head
 
             # Ship container logs to CloudWatch, as every other backend here does.
             # One group per container and one stream per environment, so dev and
             # prod stay apart under the same group.
-            #
-            # The web container is left off deliberately: nginx access logs are
-            # high-volume and say nothing a metering question needs, and no
-            # frontend in this organisation ships them either.
             logs() {
               echo "--log-driver=awslogs \
                 --log-opt awslogs-region=${{ vars.AWS_REGION }} \
@@ -427,42 +412,39 @@ jobs:
                 --restart unless-stopped "$@"
             }
 
-            if [ -n "$DO_BACKEND" ]; then
-              restart ${{ env.NAME }} \
-                -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
-                -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
-                $(logs ${{ env.NAME }}) \
-                ${{ env.RUN_ARGS }} ${BACKEND_URI}
+            restart ${{ env.NAME }} \
+              -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+              $(logs ${{ env.NAME }}) \
+              ${{ env.RUN_ARGS }} ${BACKEND_URI}
 
-              restart ${{ env.PROXY_NAME }} \
-                -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
-                -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
-                $(logs ${{ env.PROXY_NAME }}) \
-                ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
-            fi
+            restart ${{ env.PROXY_NAME }} \
+              -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
+              -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
+              $(logs ${{ env.PROXY_NAME }}) \
+              ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
 
-            # nginx resolves the upstream once at start-up, so it goes last, and
-            # is restarted whenever admin was — otherwise it keeps pointing at
-            # the address the old admin container had.
-            if [ -n "$DO_FRONTEND" ] || [ -n "$DO_BACKEND" ]; then
-              WEB_IMAGE="${FRONTEND_URI}"
-              if [ -z "$DO_FRONTEND" ]; then
-                # Backend-only deploy: reuse whatever the web container is
-                # already running rather than pulling a tag that was never built.
-                WEB_IMAGE=$(docker inspect --format '{{.Config.Image}}' ${{ env.WEB_NAME }} 2>/dev/null || echo "${FRONTEND_URI}")
+            # nginx resolves the upstream once at start-up, so a new admin
+            # container leaves it pointing at an address nothing answers on.
+            # Only done here when the frontend deploy is not going to restart it
+            # anyway — otherwise web would come up twice for one release.
+            if [ -z "$DO_FRONTEND" ]; then
+              WEB_IMAGE=$(docker inspect --format '{{.Config.Image}}' ${{ env.WEB_NAME }} 2>/dev/null || echo "")
+              if [ -n "$WEB_IMAGE" ]; then
+                restart ${{ env.WEB_NAME }} \
+                  -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
+                  -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
+                  ${{ env.WEB_RUN_ARGS }} ${WEB_IMAGE}
+              else
+                echo "::notice::no web container yet; the frontend deploy will create it"
               fi
-              restart ${{ env.WEB_NAME }} \
-                -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
-                -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
-                ${{ env.WEB_RUN_ARGS }} ${WEB_IMAGE}
             fi
 
             # A container that exits on startup would otherwise be a green
             # deploy, discovered later by someone loading the page.
             for target in \
               "admin  http://localhost:${{ env.OUT_PORT }}/healthz" \
-              "proxy  http://localhost:${{ env.PROXY_OUT_PORT }}/healthz" \
-              "web    http://localhost:${{ env.WEB_OUT_PORT }}/api/healthz"; do
+              "proxy  http://localhost:${{ env.PROXY_OUT_PORT }}/healthz"; do
               label=${target%% *}; url=${target##* }
               for attempt in 1 2 3 4 5 6 7 8 9 10; do
                 if curl -fsS --max-time 3 "$url" >/dev/null; then
@@ -471,22 +453,103 @@ jobs:
                 fi
                 if [ "$attempt" = 10 ]; then
                   echo "::error::$label did not come up at $url"
-                  docker logs --tail 50 "$( [ "$label" = web ] && echo ${{ env.WEB_NAME }} || \
-                    { [ "$label" = proxy ] && echo ${{ env.PROXY_NAME }} || echo ${{ env.NAME }}; } )" || true
+                  docker logs --tail 50 "$( [ "$label" = proxy ] && echo ${{ env.PROXY_NAME }} || echo ${{ env.NAME }} )" || true
                   exit 1
                 fi
                 sleep 3
               done
             done
 
-            # Image pruning moved to the prune-images job, which never fails the
-            # run: a prune already running on the host would fail this script and
-            # mark a deploy that actually succeeded as red.
+  # Runs whatever happened to the backend. A frontend that built is a frontend
+  # that can go out: if the backend deploy failed, its previous containers are
+  # still running and still the right thing for nginx to point at.
+  deploy-frontend:
+    needs: [setup, build-frontend, deploy-backend]
+    if: >-
+      !cancelled()
+      && needs.setup.result == 'success'
+      && needs.setup.outputs.do_frontend != ''
+      && needs.build-frontend.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - name: Restore deploy vars
+        env:
+          VARS: ${{ needs.setup.outputs.vars }}
+        run: jq -r 'to_entries[] | "\(.key)=\(.value)"' <<< "$VARS" >> "$GITHUB_ENV"
+
+      - name: Setup AWS ECR Details (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          role-session-name: GitHubActions-ECR-Pull
+          aws-region: ${{ vars.AWS_REGION }}
+
+      - name: Login to AWS ECR
+        id: login-pf-aws-ecr
+        uses: aws-actions/amazon-ecr-login@v1
+
+      - name: Get ECR login token
+        id: ecr-login-token
+        run: |
+          ECR_TOKEN=$(aws ecr get-login-password --region ${{ vars.AWS_REGION }})
+          echo "token<<EOF" >> $GITHUB_OUTPUT
+          echo "$ECR_TOKEN" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: SSH and run web
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          ECR_REGISTRY: ${{ steps.login-pf-aws-ecr.outputs.registry }}
+          ECR_TOKEN: ${{ steps.ecr-login-token.outputs.token }}
+          FRONTEND_URI: ${{ needs.build-frontend.outputs.image }}
+        with:
+          host: ${{ env.REMOTE_HOST }}
+          username: ${{ vars.REMOTE_USER }}
+          key: ${{ secrets.REMOTE_SSH_KEY }}
+          envs: ECR_REGISTRY,ECR_TOKEN,FRONTEND_URI
+          script: |
+            set -e
+            echo ${ECR_TOKEN} | docker login --username AWS --password-stdin ${ECR_REGISTRY}
+            docker pull ${FRONTEND_URI}
+
+            docker network create ${{ env.NETWORK }} 2>/dev/null || true
+
+            # No CloudWatch driver here, matching every frontend in this
+            # organisation: nginx access logs are high-volume and answer no
+            # metering question.
+            if [ "$(docker ps -a --format '{{.Names}}' | grep -cx "${{ env.WEB_NAME }}")" -gt 0 ]; then
+              docker rm -f ${{ env.WEB_NAME }}
+            fi
+            docker run --name ${{ env.WEB_NAME }} -d --network ${{ env.NETWORK }} \
+              --restart unless-stopped \
+              -p ${{ env.WEB_OUT_PORT }}:${{ env.WEB_PORT }} \
+              -e API_UPSTREAM=http://${{ env.NAME }}:${{ env.PORT }} \
+              ${{ env.WEB_RUN_ARGS }} ${FRONTEND_URI}
+
+            # Through nginx to admin, so this also proves the upstream resolved.
+            for attempt in 1 2 3 4 5 6 7 8 9 10; do
+              if curl -fsS --max-time 3 "http://localhost:${{ env.WEB_OUT_PORT }}/api/healthz" >/dev/null; then
+                echo "web ok"
+                break
+              fi
+              if [ "$attempt" = 10 ]; then
+                echo "::error::web did not come up"
+                docker logs --tail 50 ${{ env.WEB_NAME }} || true
+                exit 1
+              fi
+              sleep 3
+            done
 
   # Housekeeping only: never fails the run.
   prune-images:
-    needs: [setup, deploy]
-    if: needs.deploy.result == 'success'
+    needs: [setup, deploy-backend, deploy-frontend]
+    # Either half landing is reason enough to tidy up after it.
+    if: >-
+      needs.deploy-backend.result == 'success'
+      || needs.deploy-frontend.result == 'success'
     continue-on-error: true
     runs-on: ubuntu-latest
     steps:
@@ -574,7 +637,7 @@ jobs:
 
   # Housekeeping only: never fails the run.
   notify-teams:
-    needs: [setup, build-backend, build-frontend, deploy]
+    needs: [setup, build-backend, build-frontend, deploy-backend, deploy-frontend]
     if: always() && needs.setup.outputs.teams_webhook != ''
     continue-on-error: true
     runs-on: ubuntu-latest
@@ -582,10 +645,11 @@ jobs:
       - name: Send Teams notification (Power Automate)
         env:
           WEBHOOK: ${{ needs.setup.outputs.teams_webhook }}
-          # A build that failed never reached the deploy, and the deploy job is
-          # then skipped rather than failed — reading only its result would
-          # send a green card for a release that never went out.
-          STATUS: ${{ (needs.build-backend.result != 'failure' && needs.build-frontend.result != 'failure' && needs.deploy.result == 'success') && 'success' || 'failure' }}
+          # Green only when nothing that should have run failed. A skipped job
+          # is not a failure — half of them are skipped on a single-part deploy
+          # — but a failed build never reaches its deploy, which is then skipped
+          # too, and reading the deploys alone would call that a success.
+          STATUS: ${{ (needs.build-backend.result != 'failure' && needs.build-frontend.result != 'failure' && needs.deploy-backend.result != 'failure' && needs.deploy-frontend.result != 'failure') && 'success' || 'failure' }}
           SOURCE_REPO: ${{ needs.setup.outputs.source_repo }}
           ENVIRONMENT: ${{ needs.setup.outputs.active }}
           TAG: ${{ needs.setup.outputs.image_tag }}
