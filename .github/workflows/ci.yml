@@ -408,7 +408,14 @@ jobs:
               if [ "$(docker ps -a --format '{{.Names}}' | grep -cx "$name")" -gt 0 ]; then
                 docker rm -f "$name"
               fi
+              # host.docker.internal, because these containers are on a
+              # user-defined network rather than the default bridge. That is what
+              # lets them resolve each other by name, but it also means the
+              # 172.17.0.1 every other project here uses to reach a service on the
+              # host is the wrong gateway and simply times out. This name resolves
+              # to the right one, and keeps doing so if the network is recreated.
               docker run --name "$name" -d --network ${{ env.NETWORK }} \
+                --add-host=host.docker.internal:host-gateway \
                 --restart unless-stopped "$@"
             }
 
