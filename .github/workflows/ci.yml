@@ -18,8 +18,10 @@
 #   Secrets:   ACTION_TOKEN (can checkout the source repo api-meter), REMOTE_SSH_KEY
 #   Variables: AWS_ROLE_ARN, AWS_REGION, REMOTE_USER, AWS_ECR_REPOSITORY (api-meter)
 #
-# Two ECR repositories must exist per environment — ECR does not create them on
-# push: <AWS_ECR_REPOSITORY>/<active>/backend and <AWS_ECR_REPOSITORY>/<active>/frontend.
+# Four ECR repositories must exist — ECR does not create them on push:
+# <AWS_ECR_REPOSITORY>-{backend,frontend}/{dev,prod}. The same shape the rest of
+# the organisation uses, with the component suffixed onto the base name because
+# this repo deploys two images rather than one.
 #
 # Env is baked into the image: the source repo tracks backend/env/<ENV>.env and
 # frontend/env/<ENV>.env, the build passes --build-arg ENV=${ACTIVE}, and secrets
@@ -227,7 +229,12 @@ jobs:
           ECR_REGISTRY: ${{ steps.login.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
         run: |
-          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}/backend:${{ env.BRANCH }}"
+          # A slash is legal in a branch name and not in a docker tag, so it is
+          # replaced rather than left to fail the push at deploy time.
+          TAG="${{ env.BRANCH }}"
+          TAG="${TAG//\//-}"
+
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}-backend/${{ env.ACTIVE }}:${TAG}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           # One backend image for both processes: SERVICE is passed at
           # `docker run`, not baked, so admin and proxy are the same bytes.
@@ -277,7 +284,12 @@ jobs:
           ECR_REGISTRY: ${{ steps.login.outputs.registry }}
           ECR_REPOSITORY: ${{ vars.AWS_ECR_REPOSITORY }}
         run: |
-          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}/${{ env.ACTIVE }}/frontend:${{ env.BRANCH }}"
+          # A slash is legal in a branch name and not in a docker tag, so it is
+          # replaced rather than left to fail the push at deploy time.
+          TAG="${{ env.BRANCH }}"
+          TAG="${TAG//\//-}"
+
+          IMAGE="${ECR_REGISTRY}/${ECR_REPOSITORY}-frontend/${{ env.ACTIVE }}:${TAG}"
           echo "image=${IMAGE}" >> "$GITHUB_OUTPUT"
           # Vite inlines its config at build time, so the profile has to be
           # chosen here rather than at run time.
@@ -369,6 +381,21 @@ jobs:
                 ${BACKEND_URI} alembic upgrade head
             fi
 
+            # Ship container logs to CloudWatch, as every other backend here does.
+            # One group per container and one stream per environment, so dev and
+            # prod stay apart under the same group.
+            #
+            # The web container is left off deliberately: nginx access logs are
+            # high-volume and say nothing a metering question needs, and no
+            # frontend in this organisation ships them either.
+            logs() {
+              echo "--log-driver=awslogs \
+                --log-opt awslogs-region=${{ vars.AWS_REGION }} \
+                --log-opt awslogs-group=/docker/$1 \
+                --log-opt awslogs-stream=${{ env.ACTIVE }} \
+                --log-opt awslogs-create-group=true"
+            }
+
             restart() {
               name="$1"; shift
               if [ "$(docker ps -a --format '{{.Names}}' | grep -cx "$name")" -gt 0 ]; then
@@ -382,11 +409,13 @@ jobs:
               restart ${{ env.NAME }} \
                 -p ${{ env.OUT_PORT }}:${{ env.PORT }} \
                 -e ENV=${{ env.ACTIVE }} -e SERVICE=admin \
+                $(logs ${{ env.NAME }}) \
                 ${{ env.RUN_ARGS }} ${BACKEND_URI}
 
               restart ${{ env.PROXY_NAME }} \
                 -p ${{ env.PROXY_OUT_PORT }}:${{ env.PROXY_PORT }} \
                 -e ENV=${{ env.ACTIVE }} -e SERVICE=proxy \
+                $(logs ${{ env.PROXY_NAME }}) \
                 ${{ env.PROXY_RUN_ARGS }} ${BACKEND_URI}
             fi
 
@@ -473,18 +502,18 @@ jobs:
             CURRENT="${IMAGE_TAG}"
 
             if ! echo "$CURRENT" | grep -qE '^[vV][0-9]+\.[0-9]+\.[0-9]+$'; then
-              echo "Skip prune: IMAGE_TAG '${CURRENT}' is not semver"
+              echo "Skip prune: IMAGE_TAG '${IMAGE_TAG}' is not semver"
               exit 0
             fi
 
             # Two image repositories, not one: the backend image runs as admin
             # and proxy, the frontend image as web. The registry host is not
-            # known on this side, so match on the repository path and take the
+            # known on this side, so match on the repository name and take the
             # full name back from `docker images`.
             for part in backend frontend; do
               mapfile -t REPOS < <(
                 docker images --format '{{.Repository}}' \
-                  | grep -- "/${ECR_REPOSITORY}/${ACTIVE}/${part}\$" \
+                  | grep -- "/${ECR_REPOSITORY}-${part}/${ACTIVE}\$" \
                   | sort -u
               )
               if [ ${#REPOS[@]} -eq 0 ]; then
